@@ -1,4 +1,4 @@
-# Multi-Author Writing Style Analysis
+# Multi-Author Writing Style Analysis (In progress)
 
 ## Overview
 This project tackles the **style change detection task** for multi-author documents. The goal is to identify positions within a text where the writing style changes, indicating a potential switch in authorship. This is accomplished at the **sentence level** by analyzing each pair of consecutive sentences.
