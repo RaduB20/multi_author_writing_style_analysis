@@ -190,7 +190,8 @@ if torch.cuda.is_available():
 # ----- Code cell 7 -----
 
 # Model configuration
-MODEL_NAME = 'microsoft/deberta-v3-base'
+MODEL_NAME = 'prajjwal1/bert-mini'  # A really small model to test the code
+# Then change it to microsoft/deberta-v3-small
 MAX_LENGTH = 256  # Maximum sequence length
 BATCH_SIZE = 16  # Adjust based on your GPU memory (increase for more memory)
 LEARNING_RATE = 2e-5
