@@ -114,7 +114,7 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, load_rows: int 
     return df
 
 csv_path = os.path.join(DATA_DIR, 'loaded_data.csv')
-if not os.path.exists(csv_path) and not ALWAYS_PARSE:
+if not os.path.exists(csv_path) or ALWAYS_PARSE:
     df = load_data(DATA_DIR, **DATA_LOADING_PARAMETERS)
     df.to_csv(csv_path, index=False)
     print(f"Saved loaded data to {csv_path}\n")
@@ -156,6 +156,20 @@ print(f"Test set size: {len(test_df)}. Authorship change rate: {test_df['label']
 
 # Part 2: Training the model
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import math
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
 # We will try both with a normal topology and with a siamese topology
 
 # https://huggingface.co/spaces/mteb/leaderboard
@@ -166,134 +180,200 @@ print(f"Test set size: {len(test_df)}. Authorship change rate: {test_df['label']
 
 # ----- Code cell 5 -----
 
-import torch
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-    EarlyStoppingCallback
-)
-from datasets import Dataset
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
-import numpy as np
+CUSTOM_MODEL_NAME = 'custom-lightweight-transformer'
+MODEL_NAME = CUSTOM_MODEL_NAME  # Change to 'prajjwal1/bert-mini', 'microsoft/deberta-v3-small', etc.
 
-# Check GPU availability
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+print("="*60)
+print(f"Using {'CUSTOM' if MODEL_NAME == CUSTOM_MODEL_NAME else 'PRETRAINED'} MODEL: {MODEL_NAME}")
+print("="*60)
 
 # ----- Code cell 6 -----
 
+# Designing a custom model so that the training is faster
+class LightweightTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=2, 
+                 dim_feedforward=256, max_length=512, num_labels=2, dropout=0.1):
+        super().__init__()
+        
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        
+        self.position_embedding = nn.Embedding(max_length, d_model)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, activation='gelu', batch_first=True, norm_first=True
+        )
+        
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_labels)
+        )
+        
+        self.d_model = d_model
+        self.num_labels = num_labels
+        self.config = {
+            'vocab_size': vocab_size,
+            'd_model': d_model,
+            'nhead': nhead,
+            'num_layers': num_layers,
+            'dim_feedforward': dim_feedforward,
+            'max_length': max_length,
+            'num_labels': num_labels,
+            'dropout': dropout
+        }
+    
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        pos_ids = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0)
+        x = self.embedding(input_ids) + self.position_embedding(pos_ids)
+        
+        src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+        
+        pooled = x[:, 0, :]
+        logits = self.classifier(pooled)
+        
+        output = type('Output', (), {'logits': logits})()
+        
+        if labels is not None:
+            output.loss = F.cross_entropy(logits, labels)
+        
+        return output
+    
+    def save_pretrained(self, path):
+        """HuggingFace interface for saving the model"""
+        os.makedirs(path, exist_ok=True)
+        
+        # Save model weights
+        torch.save(self.state_dict(), os.path.join(path, 'pytorch_model.bin'))
+        
+        import json
+        with open(os.path.join(path, 'config.json'), 'w') as f:
+            json.dump(self.config, f, indent=2)
+        
+        print(f"Custom model saved to {path}")
+    
+    @classmethod
+    def from_pretrained(cls, path):
+        """HuggingFace interface for loading the model"""
+        import json
+        
+        # Load config
+        with open(os.path.join(path, 'config.json'), 'r') as f:
+            config = json.load(f)
+        
+        model = cls(**config)
+        
+        # Load weights
+        model.load_state_dict(torch.load(os.path.join(path, 'pytorch_model.bin')))
+        
+        return model
+    
+    def num_parameters(self):
+        return sum(p.numel() for p in self.parameters())
+
 # ----- Code cell 7 -----
 
-# Model configuration
-MODEL_NAME = 'prajjwal1/bert-mini'  # A really small model to test the code
-# Then change it to microsoft/deberta-v3-small
-MAX_LENGTH = 256  # Maximum sequence length
-BATCH_SIZE = 16  # Adjust based on your GPU memory (increase for more memory)
-LEARNING_RATE = 2e-5
-NUM_EPOCHS = 5
-OUTPUT_DIR = './results/deberta-authorship'
+from transformers import AutoTokenizer
 
-# Load tokenizer and model
-print(f"Loading model: {MODEL_NAME}")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_NAME,
-    num_labels=2,  # Binary classification
-    problem_type="single_label_classification"
-)
+MAX_LENGTH = 256  # Max token length for both sentences combined
+NUM_LABELS = 2  # True and False (1 and 0)
 
-# Move model to GPU
-model = model.to(device)
-print(f"Model loaded with {model.num_parameters():,} parameters")
+if MODEL_NAME == CUSTOM_MODEL_NAME:
+    
+    TOKENIZER_NAME = 'gpt2'
+    
+    BATCH_SIZE = 64
+    LEARNING_RATE = 1e-3
+    NUM_EPOCHS = 10
+    OUTPUT_DIR = './results/custom-transformer'
+    
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    tokenizer.pad_token = tokenizer.eos_token  # GPT-2 doesn't have a pad token by default
+    
+    model = LightweightTransformer(
+        vocab_size=len(tokenizer),
+        d_model=128,
+        nhead=4,
+        num_layers=2,
+        dim_feedforward=256,
+        max_length=MAX_LENGTH,
+        num_labels=NUM_LABELS,
+        dropout=0.25
+    ).to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model initialized with {total_params:,} parameters")
+    print(f"Model size: ~{total_params * 4 / 1e6:.2f} MB (float32)")
+else:
+    from transformers import AutoModelForSequenceClassification
+    
+    BATCH_SIZE = 16
+    LEARNING_RATE = 2e-5
+    NUM_EPOCHS = 5
+    OUTPUT_DIR = f'./results/{MODEL_NAME.replace("/", "-")}'
+    
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=NUM_LABELS, problem_type="single_label_classification"
+    ).to(device)
+    
+    print(f"Model loaded with {model.num_parameters():,} parameters")
 
-
-# Determining appropriate MAX_LENGTH based on data
-
-# Character length vs token length (approximate: 1 token = 4 characters)
-approx_max_tokens = longest_combined / 4
-print(f"Approximate max tokens needed: {approx_max_tokens:.0f}")
-
-def get_token_length(text1, text2):
-    tokens = tokenizer(text1, text2, truncation=False)
-    return len(tokens['input_ids'])
-
-# Sample some pairs to see actual token counts
+# Token length analysis
+print("\nAnalyzing token lengths...")
 sample_indices = df.sample(min(1000, len(df)), random_state=RANDOM_SEED).index
-token_lengths = []
-for idx in sample_indices:
-    length = get_token_length(df.loc[idx, 'sentence1'], df.loc[idx, 'sentence2'])
-    token_lengths.append(length)
+token_lengths = pd.Series([
+    len(tokenizer(df.loc[idx, 'sentence1'], df.loc[idx, 'sentence2'], truncation=False)['input_ids'])
+    for idx in sample_indices
+])
 
-token_lengths = pd.Series(token_lengths)
-print(f"\nToken length statistics:")
-print(f"  Mean: {token_lengths.mean():.0f}")
-print(f"  Median: {token_lengths.median():.0f}")
-print(f"  95th percentile: {token_lengths.quantile(0.95):.0f}")
-print(f"  99th percentile: {token_lengths.quantile(0.99):.0f}")
-print(f"  Max: {token_lengths.max()}")
-
-# Check what percentage would be truncated at different lengths
-for length in [256, 384, 512, 768]:
-    pct_truncated = (token_lengths > length).mean() * 100
-    print(f"  {pct_truncated:.2f}% would be truncated at MAX_LENGTH={length}")
-
+print(f"Token length statistics:")
+print(f"  Mean: {token_lengths.mean():.0f}, Median: {token_lengths.median():.0f}")
+print(f"  95th: {token_lengths.quantile(0.95):.0f}, 99th: {token_lengths.quantile(0.99):.0f}, Max: {token_lengths.max()}")
+for length in [256, 384, 512]:
+    print(f"  {(token_lengths > length).mean() * 100:.2f}% truncated at MAX_LENGTH={length}")
 
 # ----- Code cell 8 -----
 
-# Convert pandas DataFrames to Hugging Face Datasets
-train_dataset = Dataset.from_pandas(train_df.reset_index(drop=True))
-val_dataset = Dataset.from_pandas(validation_df.reset_index(drop=True))
-test_dataset = Dataset.from_pandas(test_df.reset_index(drop=True))
+print("\nTokenizing datasets...")
 
-def tokenize_function(examples):
-    """
-    Tokenizes sentence pairs for the model.
-    DeBERTa will use [CLS] sentence1 [SEP] sentence2 [SEP] format.
-    """
-    return tokenizer(
-        examples['sentence1'],
-        examples['sentence2'],
+def tokenize_dataframe(df, tokenizer, max_length):
+    encodings = tokenizer(
+        df['sentence1'].tolist(),
+        df['sentence2'].tolist(),
         padding='max_length',
         truncation=True,
-        max_length=MAX_LENGTH,
-        return_tensors=None  # Let the trainer handle batching
+        max_length=max_length,
+        return_tensors='pt'
     )
+    labels = torch.tensor(df['label'].astype(int).tolist(), dtype=torch.long)
+    return TensorDataset(encodings['input_ids'], encodings['attention_mask'], labels)
 
-print("Tokenizing datasets...")
-train_dataset = train_dataset.map(tokenize_function, batched=True)
-val_dataset = val_dataset.map(tokenize_function, batched=True)
-test_dataset = test_dataset.map(tokenize_function, batched=True)
+train_dataset = tokenize_dataframe(train_df, tokenizer, MAX_LENGTH)
+val_dataset = tokenize_dataframe(validation_df, tokenizer, MAX_LENGTH)
+test_dataset = tokenize_dataframe(test_df, tokenizer, MAX_LENGTH)
 
-# Set format for PyTorch
-train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
-val_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
-test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+NUM_WORKERS = 0 if os.name == 'nt' else 4  # 0 for Windows, 4 for Linux/Mac
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
 print("Tokenization complete!")
 
 # ----- Code cell 9 -----
 
-def compute_metrics(eval_pred):
-    """
-    Compute accuracy, precision, recall, F1, and AUC-ROC.
-    """
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-    
-    probs = torch.softmax(torch.tensor(logits), dim=-1)[:, 1].numpy()
-    
-    accuracy = accuracy_score(labels, predictions)
+def compute_metrics(all_preds, all_labels, all_probs):
+    accuracy = accuracy_score(all_labels, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
-        labels, predictions, average='binary', zero_division=0
+        all_labels, all_preds, average='binary', zero_division=0
     )
     
     try:
-        auc_roc = roc_auc_score(labels, probs)
+        auc_roc = roc_auc_score(all_labels, all_probs)
     except:
         auc_roc = 0.0
     
@@ -305,125 +385,175 @@ def compute_metrics(eval_pred):
         'auc_roc': auc_roc
     }
 
-# ----- Code cell 10 -----
-if __name__ == '__main__': # when turned into a jupyter notebook, this will be removed and dataloader_num_workers set to 0. Until then, this prevents issues on Windows.
+def evaluate(model, dataloader, device):
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+    total_loss = 0
     
-    training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        eval_strategy='epoch',
-        save_strategy='epoch',
-        learning_rate=LEARNING_RATE,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        num_train_epochs=NUM_EPOCHS,
-        weight_decay=0.01,
-        warmup_ratio=0.1,  # 10% of training steps for warmup
-        lr_scheduler_type='cosine',  # Options: 'linear', 'cosine', 'cosine_with_restarts', 'polynomial'
-        logging_dir=f'{OUTPUT_DIR}/logs',
-        logging_steps=50,
-        load_best_model_at_end=True,
-        metric_for_best_model='f1',
-        greater_is_better=True,
-        save_total_limit=2,  # Only keep 2 best checkpoints
-        fp16=torch.cuda.is_available(),  # Use mixed precision on GPU
-        dataloader_num_workers=4,  # Parallel data loading
-        report_to='none',  # Disable wandb/tensorboard if not needed
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids, attention_mask, labels = [b.to(device) for b in batch]
+            outputs = model(input_ids, attention_mask, labels=labels)
+            
+            total_loss += outputs.loss.item()
+            
+            probs = F.softmax(outputs.logits, dim=-1)
+            preds = torch.argmax(outputs.logits, dim=-1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())
+    
+    metrics = compute_metrics(all_preds, all_labels, all_probs)
+    metrics['loss'] = total_loss / len(dataloader)
+    
+    return metrics
+
+# ----- Markdown cell -----
+
+# Training loop with early stopping
+
+# ----- Code cell 10 -----
+
+if __name__ == '__main__':
+    
+    # Adam optimizer with L2 regularization strength to prevent overfitting, which causes a 5% penalty on large weights
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.05)
+    
+    total_steps = len(train_loader) * NUM_EPOCHS
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,  # Peak learning rate
+        total_steps=total_steps,
+        pct_start=0.1,  # Warm-up period: 10% of training spent increasing LR. Remaining 90% spent decreasing LR
+        anneal_strategy='cos'  # Cosine decreases LR smoothly, in contrast to 'linear'
     )
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
-    )
-
-    print("Starting training...")
-    print(f"Total training steps: {len(train_dataset) // BATCH_SIZE * NUM_EPOCHS}")
-
-    # ----- Code cell 11 -----
-
-    # Train the model
-    train_result = trainer.train()
-
+    
+    print("\nStarting training...")
+    print(f"Total training steps: {total_steps}")
+    print("="*50)
+    
+    best_f1 = 0
+    patience_counter = 0
+    MAX_PATIENCE = 3  # Stop training after MAX_PATIENCE epochs without improvement
+    
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        train_loss = 0
+        train_preds, train_labels_list = [], []
+        
+        for batch_idx, batch in enumerate(train_loader):
+            input_ids, attention_mask, labels = [b.to(device) for b in batch]
+            
+            optimizer.zero_grad()
+            outputs = model(input_ids, attention_mask, labels=labels)
+            outputs.loss.backward()
+            
+            # Gradient clipping: prevents exploding gradients by capping them at 1.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += outputs.loss.item()
+            
+            preds = torch.argmax(outputs.logits, dim=-1)
+            train_preds.extend(preds.cpu().numpy())
+            train_labels_list.extend(labels.cpu().numpy())
+            
+            if (batch_idx + 1) % 50 == 0:
+                print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Batch {batch_idx+1}/{len(train_loader)} - Loss: {outputs.loss.item():.4f}")
+        
+        train_acc = accuracy_score(train_labels_list, train_preds)
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # Validation
+        val_metrics = evaluate(model, val_loader, device)
+        
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
+        print(f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_acc:.4f}")
+        print(f"Val Loss: {val_metrics['loss']:.4f}")
+        print(f"Val Metrics - Acc: {val_metrics['accuracy']:.4f} | P: {val_metrics['precision']:.4f} | R: {val_metrics['recall']:.4f} | F1: {val_metrics['f1']:.4f} | AUC: {val_metrics['auc_roc']:.4f}")
+        print("-"*50)
+        
+        # Early stopping
+        if val_metrics['f1'] > best_f1:
+            best_f1 = val_metrics['f1']
+            patience_counter = 0
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            torch.save(model.state_dict(), f'{OUTPUT_DIR}/best_model.pt')
+            print(f"✓ New best model saved (F1: {best_f1:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= MAX_PATIENCE:
+                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                break
+    
     print("\n" + "="*50)
     print("Training completed!")
     print("="*50)
-    print(f"Training time: {train_result.metrics['train_runtime']:.2f} seconds")
-    print(f"Training samples/second: {train_result.metrics['train_samples_per_second']:.2f}")
-    print(f"Final training loss: {train_result.metrics['train_loss']:.4f}")
 
-    # ----- Code cell 12 -----
+# ----- Code cell 11 -----
 
-    # Evaluate on validation set
+    # Load best model
+    model.load_state_dict(torch.load(f'{OUTPUT_DIR}/best_model.pt'))
+    
     print("\nEvaluating on validation set...")
-    val_results = trainer.evaluate(val_dataset)
-
+    val_results = evaluate(model, val_loader, device)
+    
     print("\nValidation Results:")
-    print(f"  Accuracy:  {val_results['eval_accuracy']:.4f}")
-    print(f"  Precision: {val_results['eval_precision']:.4f}")
-    print(f"  Recall:    {val_results['eval_recall']:.4f}")
-    print(f"  F1 Score:  {val_results['eval_f1']:.4f}")
-    print(f"  AUC-ROC:   {val_results['eval_auc_roc']:.4f}")
+    for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
+        print(f"  {key.replace('_', '-').title():10s}: {val_results[key]:.4f}")
 
-    # ----- Code cell 13 -----
+# ----- Code cell 12 -----
 
-    # Evaluate on test set
     print("\nEvaluating on test set...")
-    test_results = trainer.evaluate(test_dataset)
-
+    test_results = evaluate(model, test_loader, device)
+    
     print("\nTest Results:")
-    print(f"  Accuracy:  {test_results['eval_accuracy']:.4f}")
-    print(f"  Precision: {test_results['eval_precision']:.4f}")
-    print(f"  Recall:    {test_results['eval_recall']:.4f}")
-    print(f"  F1 Score:  {test_results['eval_f1']:.4f}")
-    print(f"  AUC-ROC:   {test_results['eval_auc_roc']:.4f}")
+    for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
+        print(f"  {key.replace('_', '-').title():10s}: {test_results[key]:.4f}")
 
-    # ----- Code cell 14 -----
+# ----- Code cell 13 -----
 
-    # Save the final model
+    # Save final model and tokenizer
     model.save_pretrained(f'{OUTPUT_DIR}/final_model')
     tokenizer.save_pretrained(f'{OUTPUT_DIR}/final_model')
-    print(f"\nModel saved to {OUTPUT_DIR}/final_model")
+    
+    print(f"\nModel and tokenizer saved to {OUTPUT_DIR}/final_model")
 
-    # ----- Code cell 15 -----
+# ----- Code cell 14 -----
 
-    # Part 3: Inference on new data
+# Inference on new data
 
-    def predict_authorship_change(sentence1: str, sentence2: str, model, tokenizer, device):
-        """
-        Predict whether there's an authorship change between two sentences.
-        Returns: (prediction, probability)
-        """
-        inputs = tokenizer(
-            sentence1,
-            sentence2,
-            padding='max_length',
-            truncation=True,
-            max_length=MAX_LENGTH,
-            return_tensors='pt'
-        ).to(device)
-        
-        model.eval()
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1)
-            prediction = torch.argmax(probs, dim=-1).item()
-            confidence = probs[0][prediction].item()
-        
-        return bool(prediction), confidence
+def predict_authorship_change(sentence1: str, sentence2: str, model, tokenizer, device, max_length=256):
+    """Predict authorship change between two sentences"""
+    inputs = tokenizer(sentence1, sentence2, max_length=max_length, 
+                      padding='max_length', truncation=True, return_tensors='pt')
+    
+    input_ids = inputs['input_ids'].to(device)
+    attention_mask = inputs['attention_mask'].to(device)
+    
+    model.eval()
+    with torch.no_grad():
+        outputs = model(input_ids, attention_mask)
+        probs = F.softmax(outputs.logits, dim=-1)
+        prediction = torch.argmax(probs, dim=-1).item()
+        confidence = probs[0][prediction].item()
+    
+    return bool(prediction), confidence
 
-    # Test prediction
-    test_sent1 = test_df.iloc[0]['sentence1']
-    test_sent2 = test_df.iloc[0]['sentence2']
-    true_label = test_df.iloc[0]['label']
+# Test prediction
+test_sent1 = test_df.iloc[0]['sentence1']
+test_sent2 = test_df.iloc[0]['sentence2']
+true_label = test_df.iloc[0]['label']
 
-    pred, conf = predict_authorship_change(test_sent1, test_sent2, model, tokenizer, device)
+pred, conf = predict_authorship_change(test_sent1, test_sent2, model, tokenizer, device, MAX_LENGTH)
 
-    print("Example prediction:")
-    print(f"Sentence 1: {test_sent1[:100]}...")
-    print(f"Sentence 2: {test_sent2[:100]}...")
-    print(f"True label: {true_label}")
-    print(f"Predicted: {pred} (confidence: {conf:.2%})")
+print("\n" + "="*60)
+print("Example prediction:")
+print("="*60)
+print(f"Sentence 1: {test_sent1[:100]}...")
+print(f"Sentence 2: {test_sent2[:100]}...")
+print(f"True label: {true_label}")
+print(f"Predicted: {pred} (confidence: {conf:.2%})")
+print(f"\nModel used: {MODEL_NAME}")
