@@ -226,8 +226,9 @@ class LightweightTransformer(nn.Module):
         }
     
     def forward(self, input_ids, attention_mask=None, labels=None):
-        pos_ids = torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0)
-        x = self.embedding(input_ids) + self.position_embedding(pos_ids)
+        seq_len = min(input_ids.size(1), self.config['max_length'])
+        pos_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        x = self.embedding(input_ids[:, :seq_len]) + self.position_embedding(pos_ids)
         
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
@@ -244,17 +245,24 @@ class LightweightTransformer(nn.Module):
     
     def save_pretrained(self, path):
         """HuggingFace interface for saving the model"""
-        os.makedirs(path, exist_ok=True)
-        
-        # Save model weights
-        torch.save(self.state_dict(), os.path.join(path, 'pytorch_model.bin'))
-        
         import json
-        with open(os.path.join(path, 'config.json'), 'w') as f:
-            json.dump(self.config, f, indent=2)
-        
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"Invalid path: {path!r}. Path must be a non-empty string.")
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create directory '{path}': {e}")
+        try:
+            # Save model weights
+            torch.save(self.state_dict(), os.path.join(path, 'pytorch_model.bin'))
+        except Exception as e:
+            raise RuntimeError(f"Failed to save model weights to '{path}': {e}")
+        try:
+            with open(os.path.join(path, 'config.json'), 'w') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            raise RuntimeError(f"Failed to save config to '{path}': {e}")
         print(f"Custom model saved to {path}")
-    
     @classmethod
     def from_pretrained(cls, path):
         """HuggingFace interface for loading the model"""
@@ -374,7 +382,8 @@ def compute_metrics(all_preds, all_labels, all_probs):
     
     try:
         auc_roc = roc_auc_score(all_labels, all_probs)
-    except:
+    except (ValueError, AttributeError) as e:
+        print(f"Warning: Could not compute AUC-ROC: {e}")
         auc_roc = 0.0
     
     return {
@@ -417,7 +426,7 @@ def evaluate(model, dataloader, device):
 
 if __name__ == '__main__':
     
-    # Adam optimizer with L2 regularization strength to prevent overfitting, which causes a 5% penalty on large weights
+    # Adam optimizer with L2 regularization (weight_decay) to prevent overfitting
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.05)
     
     total_steps = len(train_loader) * NUM_EPOCHS
@@ -425,7 +434,7 @@ if __name__ == '__main__':
         optimizer,
         max_lr=LEARNING_RATE,  # Peak learning rate
         total_steps=total_steps,
-        pct_start=0.1,  # Warm-up period: 10% of training spent increasing LR. Remaining 90% spent decreasing LR
+        pct_start=0.1,  # Warm-up: first 10% of training increases LR to max, then 90% decreases LR with cosine annealing (may drop below initial LR)
         anneal_strategy='cos'  # Cosine decreases LR smoothly, in contrast to 'linear'
     )
     
