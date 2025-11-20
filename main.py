@@ -160,8 +160,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-import math
-import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -192,10 +190,11 @@ print("="*60)
 # Designing a custom model so that the training is faster
 class LightweightTransformer(nn.Module):
     def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=2, 
-                 dim_feedforward=256, max_length=512, num_labels=2, dropout=0.1):
+                 dim_feedforward=256, max_length=512, num_labels=2, dropout=0.1,
+                 pad_token_id=0):
         super().__init__()
         
-        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
         
         self.position_embedding = nn.Embedding(max_length, d_model)
         
@@ -245,7 +244,7 @@ class LightweightTransformer(nn.Module):
     
     def save_pretrained(self, path):
         """HuggingFace interface for saving the model"""
-        import json
+        
         if not isinstance(path, str) or not path:
             raise ValueError(f"Invalid path: {path!r}. Path must be a non-empty string.")
         try:
@@ -266,7 +265,6 @@ class LightweightTransformer(nn.Module):
     @classmethod
     def from_pretrained(cls, path):
         """HuggingFace interface for loading the model"""
-        import json
         
         # Load config
         with open(os.path.join(path, 'config.json'), 'r') as f:
@@ -275,7 +273,7 @@ class LightweightTransformer(nn.Module):
         model = cls(**config)
         
         # Load weights
-        model.load_state_dict(torch.load(os.path.join(path, 'pytorch_model.bin')))
+        model.load_state_dict(torch.load(os.path.join(path, 'pytorch_model.bin'), weights_only=True))
         
         return model
     
@@ -296,7 +294,7 @@ if MODEL_NAME == CUSTOM_MODEL_NAME:
     BATCH_SIZE = 64
     LEARNING_RATE = 1e-3
     NUM_EPOCHS = 10
-    OUTPUT_DIR = './results/custom-transformer'
+    OUTPUT_PATH = os.path.join('.', 'results', 'custom-transformer')
     
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.pad_token = tokenizer.eos_token  # GPT-2 doesn't have a pad token by default
@@ -309,7 +307,8 @@ if MODEL_NAME == CUSTOM_MODEL_NAME:
         dim_feedforward=256,
         max_length=MAX_LENGTH,
         num_labels=NUM_LABELS,
-        dropout=0.25
+        dropout=0.25,
+        pad_token_id=tokenizer.pad_token_id
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -321,7 +320,7 @@ else:
     BATCH_SIZE = 16
     LEARNING_RATE = 2e-5
     NUM_EPOCHS = 5
-    OUTPUT_DIR = f'./results/{MODEL_NAME.replace("/", "-")}'
+    OUTPUT_PATH = os.path.join('.', 'results', MODEL_NAME.replace("/", "-"))
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -329,6 +328,8 @@ else:
     ).to(device)
     
     print(f"Model loaded with {model.num_parameters():,} parameters")
+
+BEST_MODEL_PATH = os.path.join(OUTPUT_PATH, 'best_model')
 
 # Token length analysis
 print("\nAnalyzing token lengths...")
@@ -346,23 +347,47 @@ for length in [256, 384, 512]:
 
 # ----- Code cell 8 -----
 
-print("\nTokenizing datasets...")
+from torch.utils.data import Dataset
 
-def tokenize_dataframe(df, tokenizer, max_length):
-    encodings = tokenizer(
-        df['sentence1'].tolist(),
-        df['sentence2'].tolist(),
-        padding='max_length',
-        truncation=True,
-        max_length=max_length,
-        return_tensors='pt'
-    )
-    labels = torch.tensor(df['label'].astype(int).tolist(), dtype=torch.long)
-    return TensorDataset(encodings['input_ids'], encodings['attention_mask'], labels)
+print("\nSetting up datasets for lazy tokenization...")
 
-train_dataset = tokenize_dataframe(train_df, tokenizer, MAX_LENGTH)
-val_dataset = tokenize_dataframe(validation_df, tokenizer, MAX_LENGTH)
-test_dataset = tokenize_dataframe(test_df, tokenizer, MAX_LENGTH)
+class LazyTokenizationDataset(Dataset):
+    """
+    Custom PyTorch Dataset that tokenizes data samples on-the-fly (lazily).
+    This significantly reduces memory usage compared to eager tokenization.
+    """
+    def __init__(self, dataframe, tokenizer, max_length):
+        self.df = dataframe
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        sentence1 = row['sentence1']
+        sentence2 = row['sentence2']
+        label = int(row['label']) # Convert boolean to 0 or 1
+
+        encoding = self.tokenizer(
+            sentence1,
+            sentence2,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt' # Return as PyTorch tensors
+        )
+        
+        input_ids = encoding['input_ids'].squeeze(0)
+        attention_mask = encoding['attention_mask'].squeeze(0)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+
+        return input_ids, attention_mask, label_tensor
+
+train_dataset = LazyTokenizationDataset(train_df, tokenizer, MAX_LENGTH)
+val_dataset = LazyTokenizationDataset(validation_df, tokenizer, MAX_LENGTH)
+test_dataset = LazyTokenizationDataset(test_df, tokenizer, MAX_LENGTH)
 
 NUM_WORKERS = 0 if os.name == 'nt' else 4  # 0 for Windows, 4 for Linux/Mac
 
@@ -370,7 +395,7 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, nu
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
-print("Tokenization complete!")
+print("Lazy tokenization setup complete!")
 
 # ----- Code cell 9 -----
 
@@ -488,9 +513,9 @@ if __name__ == '__main__':
         if val_metrics['f1'] > best_f1:
             best_f1 = val_metrics['f1']
             patience_counter = 0
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            torch.save(model.state_dict(), f'{OUTPUT_DIR}/best_model.pt')
-            print(f"✓ New best model saved (F1: {best_f1:.4f})")
+            os.makedirs(OUTPUT_PATH, exist_ok=True)
+            model.save_pretrained(BEST_MODEL_PATH)
+            print(f"✓ New best model saved to {BEST_MODEL_PATH} (F1: {best_f1:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= MAX_PATIENCE:
@@ -501,11 +526,24 @@ if __name__ == '__main__':
     print("Training completed!")
     print("="*50)
 
+    tokenizer.save_pretrained(BEST_MODEL_PATH)
+    print(f"Tokenizer saved to {BEST_MODEL_PATH}")
+
+# ----- Markdown cell -----
+
+# The following cell should be able to run independently after training is complete, since it loads the best model from disk
+
 # ----- Code cell 11 -----
 
-    # Load best model
-    model.load_state_dict(torch.load(f'{OUTPUT_DIR}/best_model.pt', weights_only=True))
-    
+    if MODEL_NAME == CUSTOM_MODEL_NAME:
+        model = LightweightTransformer.from_pretrained(BEST_MODEL_PATH)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(BEST_MODEL_PATH)
+    model = model.to(device)
+    tokenizer = AutoTokenizer.from_pretrained(BEST_MODEL_PATH)
+
+# ----- Code cell 12 -----
+
     print("\nEvaluating on validation set...")
     val_results = evaluate(model, val_loader, device)
     
@@ -513,7 +551,7 @@ if __name__ == '__main__':
     for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
         print(f"  {key.replace('_', '-').title():10s}: {val_results[key]:.4f}")
 
-# ----- Code cell 12 -----
+# ----- Code cell 13 -----
 
     print("\nEvaluating on test set...")
     test_results = evaluate(model, test_loader, device)
@@ -521,14 +559,6 @@ if __name__ == '__main__':
     print("\nTest Results:")
     for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
         print(f"  {key.replace('_', '-').title():10s}: {test_results[key]:.4f}")
-
-# ----- Code cell 13 -----
-
-    # Save final model and tokenizer
-    model.save_pretrained(f'{OUTPUT_DIR}/final_model')
-    tokenizer.save_pretrained(f'{OUTPUT_DIR}/final_model')
-    
-    print(f"\nModel and tokenizer saved to {OUTPUT_DIR}/final_model")
 
 # ----- Code cell 14 -----
 
