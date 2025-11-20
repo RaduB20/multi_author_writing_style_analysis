@@ -13,6 +13,8 @@ import os
 import requests
 import zipfile
 
+RANDOM_SEED = 42
+
 DATA_URL = "https://zenodo.org/records/14891299/files/pan25-multi-author-analysis.zip"
 DATA_DIR = "data"
 ZIP_FILE_NAME = "pan25-multi-author-analysis.zip"
@@ -43,7 +45,6 @@ if not all(level in os.listdir(DATA_DIR) for level in DIFFICULTY_LEVELS):
 ALWAYS_PARSE = False  # Set to True to always re-parse the data
 DATA_LOADING_PARAMETERS = {
     "difficulty_levels": DIFFICULTY_LEVELS[0],
-    "use_all_possible_pairs": True,
     "load_problems": 2  # Set to None to load all the data
 }
 
@@ -220,21 +221,6 @@ print(f"Longest combined sentence pair length: {longest_combined}")
 
 # ----- Code cell 3 -----
 
-from sklearn.model_selection import train_test_split
-
-TRAIN_RATIO = 0.7 # 70% for training
-VALIDATION_TEST_RATIO = 0.5 # of the remaining 30%, split equally between validation and test, i.e., 15% each
-RANDOM_SEED = 42
-
-train_df, temp_df = train_test_split(df, train_size=TRAIN_RATIO, random_state=RANDOM_SEED, stratify=df['label'])
-validation_df, test_df = train_test_split(temp_df, train_size=VALIDATION_TEST_RATIO, random_state=RANDOM_SEED, stratify=temp_df['label'])
-
-print(f"Training set size: {len(train_df)}. Authorship change rate: {train_df['label'].mean():.2%}")
-print(f"Validation set size: {len(validation_df)}. Authorship change rate: {validation_df['label'].mean():.2%}")
-print(f"Test set size: {len(test_df)}. Authorship change rate: {test_df['label'].mean():.2%}")
-
-# ----- Code cell 4 -----
-
 # Part 2: Training the model
 
 import torch
@@ -257,7 +243,7 @@ if torch.cuda.is_available():
 # https://huggingface.co/Qwen/Qwen3-Embedding-8B
 # https://huggingface.co/Qwen/Qwen3-Embedding-4B
 
-# ----- Code cell 5 -----
+# ----- Code cell 4 -----
 
 CUSTOM_MODEL_NAME = 'custom-lightweight-transformer'
 MODEL_NAME = CUSTOM_MODEL_NAME  # Change to 'prajjwal1/bert-mini', 'microsoft/deberta-v3-small', etc.
@@ -266,7 +252,7 @@ print("="*60)
 print(f"Using {'CUSTOM' if MODEL_NAME == CUSTOM_MODEL_NAME else 'PRETRAINED'} MODEL: {MODEL_NAME}")
 print("="*60)
 
-# ----- Code cell 6 -----
+# ----- Code cell 5 -----
 
 # Designing a custom model so that the training is faster
 class LightweightTransformer(nn.Module):
@@ -302,13 +288,17 @@ class LightweightTransformer(nn.Module):
             'dim_feedforward': dim_feedforward,
             'max_length': max_length,
             'num_labels': num_labels,
-            'dropout': dropout
+            'dropout': dropout,
+            'pad_token_id': pad_token_id
         }
     
     def forward(self, input_ids, attention_mask=None, labels=None):
         seq_len = min(input_ids.size(1), self.config['max_length'])
         pos_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
         x = self.embedding(input_ids[:, :seq_len]) + self.position_embedding(pos_ids)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, :seq_len]
         
         src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
         x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
@@ -361,7 +351,7 @@ class LightweightTransformer(nn.Module):
     def num_parameters(self):
         return sum(p.numel() for p in self.parameters())
 
-# ----- Code cell 7 -----
+# ----- Code cell 6 -----
 
 from transformers import AutoTokenizer
 
@@ -426,9 +416,20 @@ print(f"  95th: {token_lengths.quantile(0.95):.0f}, 99th: {token_lengths.quantil
 for length in [256, 384, 512]:
     print(f"  {(token_lengths > length).mean() * 100:.2f}% truncated at MAX_LENGTH={length}")
 
-# ----- Code cell 8 -----
+# ----- Code cell 7 -----
 
+from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
+
+TRAIN_RATIO = 0.7 # 70% for training
+VALIDATION_TEST_RATIO = 0.5 # of the remaining 30%, split equally between validation and test, i.e., 15% each
+
+train_df, temp_df = train_test_split(df, train_size=TRAIN_RATIO, random_state=RANDOM_SEED, stratify=df['label'])
+validation_df, test_df = train_test_split(temp_df, train_size=VALIDATION_TEST_RATIO, random_state=RANDOM_SEED, stratify=temp_df['label'])
+
+print(f"Training set size: {len(train_df)}. Authorship change rate: {train_df['label'].mean():.2%}")
+print(f"Validation set size: {len(validation_df)}. Authorship change rate: {validation_df['label'].mean():.2%}")
+print(f"Test set size: {len(test_df)}. Authorship change rate: {test_df['label'].mean():.2%}")
 
 print("\nSetting up datasets for lazy tokenization...")
 
@@ -478,7 +479,7 @@ test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num
 
 print("Lazy tokenization setup complete!")
 
-# ----- Code cell 9 -----
+# ----- Code cell 8 -----
 
 def compute_metrics(all_preds, all_labels, all_probs):
     accuracy = accuracy_score(all_labels, all_preds)
@@ -489,7 +490,7 @@ def compute_metrics(all_preds, all_labels, all_probs):
     try:
         auc_roc = roc_auc_score(all_labels, all_probs)
     except (ValueError, AttributeError) as e:
-        print(f"Warning: Could not compute AUC-ROC: {e}")
+        print(f"Warning: Could not compute AUC-ROC ({type(e).__name__}): {e}")
         auc_roc = 0.0
     
     return {
@@ -528,7 +529,7 @@ def evaluate(model, dataloader, device):
 
 # Training loop with early stopping
 
-# ----- Code cell 10 -----
+# ----- Code cell 9 -----
 
 if __name__ == '__main__':
     
@@ -614,34 +615,34 @@ if __name__ == '__main__':
 
 # The following cell should be able to run independently after training is complete, since it loads the best model from disk
 
+# ----- Code cell 10 -----
+
+if MODEL_NAME == CUSTOM_MODEL_NAME:
+    model = LightweightTransformer.from_pretrained(BEST_MODEL_PATH)
+else:
+    model = AutoModelForSequenceClassification.from_pretrained(BEST_MODEL_PATH)
+model = model.to(device)
+tokenizer = AutoTokenizer.from_pretrained(BEST_MODEL_PATH)
+
 # ----- Code cell 11 -----
 
-    if MODEL_NAME == CUSTOM_MODEL_NAME:
-        model = LightweightTransformer.from_pretrained(BEST_MODEL_PATH)
-    else:
-        model = AutoModelForSequenceClassification.from_pretrained(BEST_MODEL_PATH)
-    model = model.to(device)
-    tokenizer = AutoTokenizer.from_pretrained(BEST_MODEL_PATH)
+print("\nEvaluating on validation set...")
+val_results = evaluate(model, val_loader, device)
+
+print("\nValidation Results:")
+for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
+    print(f"  {key.replace('_', '-').title():10s}: {val_results[key]:.4f}")
 
 # ----- Code cell 12 -----
 
-    print("\nEvaluating on validation set...")
-    val_results = evaluate(model, val_loader, device)
-    
-    print("\nValidation Results:")
-    for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
-        print(f"  {key.replace('_', '-').title():10s}: {val_results[key]:.4f}")
+print("\nEvaluating on test set...")
+test_results = evaluate(model, test_loader, device)
+
+print("\nTest Results:")
+for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
+    print(f"  {key.replace('_', '-').title():10s}: {test_results[key]:.4f}")
 
 # ----- Code cell 13 -----
-
-    print("\nEvaluating on test set...")
-    test_results = evaluate(model, test_loader, device)
-    
-    print("\nTest Results:")
-    for key in ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']:
-        print(f"  {key.replace('_', '-').title():10s}: {test_results[key]:.4f}")
-
-# ----- Code cell 14 -----
 
 # Inference on new data
 
