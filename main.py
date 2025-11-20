@@ -49,10 +49,17 @@ DATA_LOADING_PARAMETERS = {
 import pandas as pd
 import json
 
-def load_data(data_dir: str, difficulty_levels: list[str] | str, load_rows: int = None) -> pd.DataFrame:
+def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possible_pairs: bool = False, load_rows: int = None) -> pd.DataFrame:
     """
     Loads data from the specified directory and difficulty levels and returns it as a single dataframe.
-    Returns a dataframe with columns: sentence1, sentence2, label.
+
+    Parameters:
+        data_dir: Directory containing the data.
+        difficulty_levels: List of difficulty levels to load (e.g., ['easy', 'medium']).
+        use_all_possible_pairs: For sentences by the same author, creates all possible pairs.
+        load_rows: Maximum number of problem files to load per split and difficulty level. If None, loads all.
+    Returns:
+        pd.DataFrame: DataFrame with columns 'sentence1', 'sentence2', 'label'.
     """
     if not isinstance(difficulty_levels, (list, set, tuple)):
         difficulty_levels = [difficulty_levels]
@@ -71,7 +78,7 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, load_rows: int 
             
             problem_files = sorted([f for f in os.listdir(split_dir) if f.startswith('problem-') and f.endswith('.txt')])
             
-            for idx, problem_file in enumerate(problem_files):
+            for idx, problem_file in enumerate(problem_files): # Iterate over problem files
                 if load_rows is not None and idx >= load_rows:
                     break
                 
@@ -96,12 +103,46 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, load_rows: int 
                     skipped_count += 1
                     continue
                 
-                for i in range(len(sentences) - 1):
-                    rows.append({
-                        'sentence1': sentences[i],
-                        'sentence2': sentences[i + 1],
-                        'label': changes[i] != 0  # Storing as boolean (label: True if changed, False otherwise)
-                    })
+                if not use_all_possible_pairs:
+                    # Create pairs only between 2 consecutive sentences
+                    for i in range(len(sentences) - 1):
+                        rows.append({
+                            'sentence1': sentences[i],
+                            'sentence2': sentences[i + 1],
+                            'label': changes[i] != 0  # Storing as boolean (label: True if changed, False otherwise)
+                        })
+                else:
+                    i = 0
+                    while i < len(sentences): # Iterate over sentences in the current problem file
+                        # Find the extent of the current author group
+                        j = i
+                        while j < len(changes) and changes[j] == 0:
+                            j += 1
+                        
+                        # sentences[i:j+1] are all from the same author
+                        group_size = j - i + 1
+                        
+                        if group_size > 1:
+                            # Create all pairs within this group
+                            for k in range(i, j + 1):
+                                for l in range(k + 1, j + 1):
+                                    rows.append({
+                                        'sentence1': sentences[k],
+                                        'sentence2': sentences[l],
+                                        'label': False  # Same author
+                                    })
+                        
+                        # If there is a change after position j, add the cross-boundary pair
+                        # This will only be false at the end of the file
+                        if j < len(changes) and changes[j] != 0:
+                            rows.append({
+                                'sentence1': sentences[j],
+                                'sentence2': sentences[j + 1],
+                                'label': True  # Different authors
+                            })
+                        
+                        # Next author group
+                        i = j + 1
     
     df = pd.DataFrame(rows)
 
