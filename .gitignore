@@ -72,3 +72,4 @@ instance/
 
 # Data files
 /data
+/results
