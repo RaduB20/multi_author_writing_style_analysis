@@ -43,13 +43,14 @@ if not all(level in os.listdir(DATA_DIR) for level in DIFFICULTY_LEVELS):
 ALWAYS_PARSE = False  # Set to True to always re-parse the data
 DATA_LOADING_PARAMETERS = {
     "difficulty_levels": DIFFICULTY_LEVELS[0],
-    "load_rows": 10000  # Set to None to load all rows
+    "use_all_possible_pairs": True,
+    "load_problems": 2  # Set to None to load all the data
 }
 
 import pandas as pd
 import json
 
-def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possible_pairs: bool = False, load_rows: int = None) -> pd.DataFrame:
+def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possible_pairs: bool = False, swap_sentences: bool = False, load_problems: int = None) -> pd.DataFrame:
     """
     Loads data from the specified directory and difficulty levels and returns it as a single dataframe.
 
@@ -57,7 +58,8 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possibl
         data_dir: Directory containing the data.
         difficulty_levels: List of difficulty levels to load (e.g., ['easy', 'medium']).
         use_all_possible_pairs: For sentences by the same author, creates all possible pairs.
-        load_rows: Maximum number of problem files to load per split and difficulty level. If None, loads all.
+        load_problems: Maximum number of problem files to load per split and difficulty level. If None, loads all.
+        swap_sentences: If True, creates additional rows with sentence1 and sentence2 swapped.
     Returns:
         pd.DataFrame: DataFrame with columns 'sentence1', 'sentence2', 'label'.
     """
@@ -79,7 +81,7 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possibl
             problem_files = sorted([f for f in os.listdir(split_dir) if f.startswith('problem-') and f.endswith('.txt')])
             
             for idx, problem_file in enumerate(problem_files): # Iterate over problem files
-                if load_rows is not None and idx >= load_rows:
+                if load_problems is not None and idx >= load_problems:
                     break
                 
                 problem_num = problem_file.replace('problem-', '').replace('.txt', '')
@@ -97,12 +99,13 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possibl
                 
                 with open(truth_path, 'r', encoding='utf-8') as f:
                     truth_data = json.load(f)
+                    authors = truth_data.get('authors', 0)
                     changes = truth_data.get('changes', [])
                 
-                if len(sentences) != len(changes) + 1:
+                if len(sentences) != len(changes) + 1 or authors < 1:
                     skipped_count += 1
                     continue
-                
+
                 if not use_all_possible_pairs:
                     # Create pairs only between 2 consecutive sentences
                     for i in range(len(sentences) - 1):
@@ -112,45 +115,82 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possibl
                             'label': changes[i] != 0  # Storing as boolean (label: True if changed, False otherwise)
                         })
                 else:
-                    i = 0
-                    while i < len(sentences): # Iterate over sentences in the current problem file
-                        # Find the extent of the current author group
-                        j = i
-                        while j < len(changes) and changes[j] == 0:
-                            j += 1
+                    # If there are exactly 2 authors, use optimized approach
+                    if authors == 2:
+                        # Assign sentences to authors
+                        author_sentences = [[], []]  # [author_0_sentences, author_1_sentences]
+                        current_author = 0
                         
-                        # sentences[i:j+1] are all from the same author
-                        group_size = j - i + 1
+                        for i in range(len(sentences)):
+                            author_sentences[current_author].append(sentences[i])
+                            if i < len(changes) and changes[i] != 0:
+                                current_author = 1 - current_author  # Switch between 0 and 1
                         
-                        if group_size > 1:
-                            # Create all pairs within this group
-                            for k in range(i, j + 1):
-                                for l in range(k + 1, j + 1):
+                        # Create all pairs within each author group (label=False)
+                        for author_group in author_sentences:
+                            for i in range(len(author_group)):
+                                for j in range(i + 1, len(author_group)):
                                     rows.append({
-                                        'sentence1': sentences[k],
-                                        'sentence2': sentences[l],
+                                        'sentence1': author_group[i],
+                                        'sentence2': author_group[j],
                                         'label': False  # Same author
                                     })
                         
-                        # If there is a change after position j, add the cross-boundary pair
-                        # This will only be false at the end of the file
-                        if j < len(changes) and changes[j] != 0:
-                            rows.append({
-                                'sentence1': sentences[j],
-                                'sentence2': sentences[j + 1],
-                                'label': True  # Different authors
-                            })
-                        
-                        # Next author group
-                        i = j + 1
+                        # Create all pairs across authors (label=True)
+                        for sent_a in author_sentences[0]:
+                            for sent_b in author_sentences[1]:
+                                rows.append({
+                                    'sentence1': sent_a,
+                                    'sentence2': sent_b,
+                                    'label': True  # Different authors
+                                })
+                    else:
+                        # For more than 2 authors, use the sequential approach
+                        i = 0
+                        while i < len(sentences): # Iterate over sentences in the current problem file
+                            # Find the extent of the current author group
+                            j = i
+                            while j < len(changes) and changes[j] == 0:
+                                j += 1
+                            
+                            # sentences[i:j+1] are all from the same author
+                            group_size = j - i + 1
+                            
+                            if group_size > 1:
+                                # Create all pairs within this group
+                                for k in range(i, j + 1):
+                                    for l in range(k + 1, j + 1):
+                                        rows.append({
+                                            'sentence1': sentences[k],
+                                            'sentence2': sentences[l],
+                                            'label': False  # Same author
+                                        })
+                            
+                            # If there is a change after position j, add the cross-boundary pair
+                            # This will only be false at the end of the file
+                            if j < len(changes) and changes[j] != 0:
+                                rows.append({
+                                    'sentence1': sentences[j],
+                                    'sentence2': sentences[j + 1],
+                                    'label': True  # Different authors
+                                })
+                            
+                            # Next author group
+                            i = j + 1
     
     df = pd.DataFrame(rows)
 
     df['sentence1'] = df['sentence1'].astype('string')
     df['sentence2'] = df['sentence2'].astype('string')
     df['label'] = df['label'].astype('boolean')
-    
+
     print(f"Total documents skipped due to mismatches: {skipped_count}")
+    
+    if swap_sentences:
+        df_swapped = df.copy()
+        df_swapped['sentence1'], df_swapped['sentence2'] = df['sentence2'], df['sentence1']
+        df = pd.concat([df, df_swapped], ignore_index=True)
+        print(f"Swapped sentences created and concatenated (total rows doubled)")
     
     return df
 
