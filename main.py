@@ -204,7 +204,7 @@ class LightweightTransformer(nn.Module):
             dropout=dropout, activation='gelu', batch_first=True, norm_first=True
         )
         
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
@@ -495,7 +495,7 @@ if __name__ == '__main__':
 # ----- Code cell 11 -----
 
     # Load best model
-    model.load_state_dict(torch.load(f'{OUTPUT_DIR}/best_model.pt'))
+    model.load_state_dict(torch.load(f'{OUTPUT_DIR}/best_model.pt', weights_only=True))
     
     print("\nEvaluating on validation set...")
     val_results = evaluate(model, val_loader, device)
