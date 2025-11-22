@@ -10,13 +10,33 @@
 # ----- Code cell 1 -----
 
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import requests
 import zipfile
+import pandas as pd
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.model_selection import train_test_split
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+import matplotlib.pyplot as plt
 
 RANDOM_SEED = 42
 NUM_WORKERS = 0 if os.name == 'nt' else 4
 ALWAYS_PARSE = False  # Set to True to always re-parse the data
 ALWAYS_TRAIN = False  # Set to True to always re-train the model
+
+# Class imbalance parameters
+UPSAMPLE_UNDERREPRESENTED_CLASS = False
+WEIGHTED_LOSS = False
+WEIGHTED_SAMPLER = True
+LABEL_SMOOTHING = True
 
 DATA_URL = "https://zenodo.org/records/14891299/files/pan25-multi-author-analysis.zip"
 DATA_DIR = "data"
@@ -47,13 +67,11 @@ if not all(level in os.listdir(DATA_DIR) for level in DIFFICULTY_LEVELS):
 
 DATA_LOADING_PARAMETERS = {
     "difficulty_levels": DIFFICULTY_LEVELS[0],
-    "load_problems": 100  # Set to None to load all the data
+    "swap_different_author_sentences": UPSAMPLE_UNDERREPRESENTED_CLASS,
+    "load_problems": None  # Set to None to load all the data
 }
 
-import pandas as pd
-import json
-
-def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possible_pairs: bool = False, swap_sentences: bool = False, load_problems: int = None) -> pd.DataFrame:
+def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possible_pairs: bool = False, swap_same_author_sentences: bool = False, swap_different_author_sentences: bool = False, load_problems: int = None) -> pd.DataFrame:
     """
     Loads data from the specified directory and difficulty levels and returns it as a single dataframe.
 
@@ -62,7 +80,7 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possibl
         difficulty_levels: List of difficulty levels to load (e.g., ['easy', 'medium']).
         use_all_possible_pairs: For sentences by the same author, creates all possible pairs.
         load_problems: Maximum number of problem files to load per split and difficulty level. If None, loads all.
-        swap_sentences: If True, creates additional rows with sentence1 and sentence2 swapped.
+        swap_same_author_sentences, swap_different_author_sentences: If True, creates additional rows with sentence1 and sentence2 swapped for the respective case.
     Returns:
         pd.DataFrame: DataFrame with columns 'sentence1', 'sentence2', 'label'.
     """
@@ -189,12 +207,20 @@ def load_data(data_dir: str, difficulty_levels: list[str] | str, use_all_possibl
 
     print(f"Total documents skipped due to mismatches: {skipped_count}")
     
-    if swap_sentences:
-        df_swapped = df.copy()
-        df_swapped['sentence1'], df_swapped['sentence2'] = df['sentence2'], df['sentence1']
-        df = pd.concat([df, df_swapped], ignore_index=True)
-        print(f"Swapped sentences created and concatenated (total rows doubled)")
-    
+    if swap_same_author_sentences:
+        df_same = df[df['label'] == False].copy()
+        df_same['sentence1'], df_same['sentence2'] = df_same['sentence2'], df_same['sentence1']
+        rows_added = len(df_same)
+        df = pd.concat([df, df_same], ignore_index=True)
+        print(f"Added {rows_added} swapped same-author sentence pairs to the dataset")
+
+    if swap_different_author_sentences:
+        df_diff = df[df['label'] == True].copy()
+        df_diff['sentence1'], df_diff['sentence2'] = df_diff['sentence2'], df_diff['sentence1']
+        rows_added = len(df_diff)
+        df = pd.concat([df, df_diff], ignore_index=True)
+        print(f"Added {rows_added} swapped different-author sentence pairs to the dataset")
+
     return df
 
 csv_path = os.path.join(DATA_DIR, 'loaded_data.csv')
@@ -224,17 +250,6 @@ print(f"Longest combined sentence pair length: {longest_combined}")
 # ----- Code cell 3 -----
 
 # Part 2: Training the model
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
-from sklearn.model_selection import train_test_split
-from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
-from dataclasses import dataclass, field
-from typing import Dict
-from abc import ABC, abstractmethod
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -282,8 +297,8 @@ class BaseEncoder(nn.Module, ABC):
 class LightweightTransformerEncoder(BaseEncoder):
     """Custom lightweight transformer that only encodes (no classification head)"""
     
-    def __init__(self, vocab_size, d_model=128, nhead=4, num_layers=2,
-                 dim_feedforward=256, max_length=512, dropout=0.1, pad_token_id=0):
+    def __init__(self, vocab_size, d_model, nhead, num_layers,
+                 dim_feedforward, max_length, dropout, pad_token_id):
         super().__init__()
         
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
@@ -383,7 +398,7 @@ class PretrainedEncoder(BaseEncoder):
 class ClassificationHead(nn.Module):
     """Simple classification head"""
     
-    def __init__(self, input_dim: int, num_labels: int = 2, dropout: float = 0.1):
+    def __init__(self, input_dim: int, dropout: float, num_labels: int = 2):
         super().__init__()
         self.classifier = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
@@ -415,7 +430,7 @@ class AuthorshipModel(nn.Module):
     Can operate in standard mode (concatenated input) or siamese mode (separate encoding).
     """
     
-    def __init__(self, encoder: BaseEncoder, num_labels: int = 2, dropout: float = 0.1,
+    def __init__(self, encoder: BaseEncoder, dropout: float, num_labels: int = 2,
                  siamese: bool = False, similarity_method: str = 'concat_diff_mult'):
         super().__init__()
         
@@ -439,7 +454,7 @@ class AuthorshipModel(nn.Module):
         else:
             classifier_input = encoder_dim
         
-        self.classifier = ClassificationHead(classifier_input, num_labels, dropout)
+        self.classifier = ClassificationHead(classifier_input, num_labels=num_labels, dropout=dropout)
         
         self.config = {
             'num_labels': num_labels,
@@ -448,7 +463,7 @@ class AuthorshipModel(nn.Module):
             'similarity_method': similarity_method
         }
     
-    def forward(self, input_ids1, attention_mask1, input_ids2=None, attention_mask2=None, labels=None):
+    def forward(self, input_ids1, attention_mask1, input_ids2=None, attention_mask2=None, labels=None, class_weights=None, label_smoothing=0.0):
         """
         Forward pass.
         - Standard mode: input_ids1/attention_mask1 contain concatenated sentences
@@ -476,7 +491,8 @@ class AuthorshipModel(nn.Module):
         output = type('Output', (), {'logits': logits})()
         
         if labels is not None:
-            output.loss = F.cross_entropy(logits, labels)
+            # We add label smoothing for better generalization since the dataset is very imbalanced
+            output.loss = F.cross_entropy(logits, labels, weight=class_weights, label_smoothing=label_smoothing)
         
         return output
     
@@ -503,24 +519,50 @@ class AuthorshipModel(nn.Module):
 
 
 class HuggingFaceModelWrapper(nn.Module):
-    """Thin wrapper around HuggingFace AutoModelForSequenceClassification"""
+    """Wrapper around HuggingFace models with custom classification head"""
     
-    def __init__(self, model_name: str, num_labels: int = 2):
+    def __init__(self, model_name: str, dropout: float, num_labels: int = 2):
         super().__init__()
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name, num_labels=num_labels, problem_type="single_label_classification"
+        # Load only the base model, not the classification head
+        self.encoder = AutoModel.from_pretrained(model_name)
+        self.classifier = ClassificationHead(
+            input_dim=self.encoder.config.hidden_size,
+            dropout=dropout,
+            num_labels=num_labels
         )
         self.model_name = model_name
         self.num_labels = num_labels
+        self.dropout = dropout
         self.siamese = False
     
-    def forward(self, input_ids1, attention_mask1, input_ids2=None, attention_mask2=None, labels=None):
-        return self.model(input_ids=input_ids1, attention_mask=attention_mask1, labels=labels)
-    
+    def forward(self, input_ids1, attention_mask1, input_ids2=None, attention_mask2=None, labels=None, class_weights=None, label_smoothing=0.0):
+        outputs = self.encoder(input_ids=input_ids1, attention_mask=attention_mask1)
+        
+        # Use pooler_output if available, otherwise CLS token
+        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+            pooled = outputs.pooler_output
+        else:
+            pooled = outputs.last_hidden_state[:, 0, :]
+        
+        logits = self.classifier(pooled)
+        
+        output = type('Output', (), {'logits': logits})()
+        
+        if labels is not None:
+            # We add label smoothing for better generalization since the dataset is very imbalanced
+            output.loss = F.cross_entropy(logits, labels, weight=class_weights, label_smoothing=label_smoothing)
+        
+        return output
+        
     def save_pretrained(self, path: str):
-        self.model.save_pretrained(path)
+        self.encoder.save_pretrained(os.path.join(path, 'encoder'))
+        self.classifier.save_pretrained(path)
         with open(os.path.join(path, 'wrapper_info.json'), 'w') as f:
-            json.dump({'model_name': self.model_name, 'num_labels': self.num_labels}, f)
+            json.dump({
+                'model_name': self.model_name,
+                'num_labels': self.num_labels,
+                'dropout': self.dropout
+            }, f)
     
     @classmethod
     def from_pretrained(cls, path: str):
@@ -528,15 +570,16 @@ class HuggingFaceModelWrapper(nn.Module):
             info = json.load(f)
         instance = object.__new__(cls)
         nn.Module.__init__(instance)
-        instance.model = AutoModelForSequenceClassification.from_pretrained(path)
+        instance.encoder = AutoModel.from_pretrained(os.path.join(path, 'encoder'))
+        instance.classifier = ClassificationHead.from_pretrained(path)
         instance.model_name = info['model_name']
         instance.num_labels = info['num_labels']
+        instance.dropout = info.get('dropout', 0.1)
         instance.siamese = False
         return instance
     
     def num_parameters(self):
         return sum(p.numel() for p in self.parameters())
-
 
 # ----- Code cell 6 -----
 
@@ -617,8 +660,7 @@ class ModelConfig:
     batch_size: int
     learning_rate: float
     num_epochs: int
-    output_path: str
-    best_model_path: str
+    model_path: str
     is_siamese: bool
     is_custom: bool
     dataset_class: type
@@ -635,7 +677,7 @@ def get_model_config(
     custom_nhead: int = 4,
     custom_num_layers: int = 2,
     custom_dim_feedforward: int = 256,
-    custom_dropout: float = 0.25,
+    dropout: float = 0.25,
     # Siamese parameters
     siamese_similarity_method: str = 'concat_diff_mult',
     # Training parameters
@@ -659,8 +701,7 @@ def get_model_config(
     base_model_name = model_name[len(SIAMESE_PREFIX):] if is_siamese else model_name
     is_custom = base_model_name == CUSTOM_MODEL_NAME
     
-    output_path = os.path.join('.', 'results', model_name.replace("/", "-"))
-    best_model_path = os.path.join(output_path, 'best_model')
+    model_path = os.path.join('.', 'results', model_name.replace("/", "-"))
     
     print("=" * 60)
     print(f"Model: {model_name}")
@@ -678,14 +719,14 @@ def get_model_config(
             num_layers=custom_num_layers,
             dim_feedforward=custom_dim_feedforward,
             max_length=max_length,
-            dropout=custom_dropout,
+            dropout=dropout,
             pad_token_id=tokenizer.pad_token_id
         )
         
         model = AuthorshipModel(
             encoder=encoder,
             num_labels=num_labels,
-            dropout=custom_dropout,
+            dropout=dropout,
             siamese=is_siamese,
             similarity_method=siamese_similarity_method
         ).to(device)
@@ -701,13 +742,13 @@ def get_model_config(
             model = AuthorshipModel(
                 encoder=encoder,
                 num_labels=num_labels,
-                dropout=0.1,
+                dropout=dropout,
                 siamese=True,
                 similarity_method=siamese_similarity_method
             ).to(device)
             encoder_class = PretrainedEncoder
         else:
-            model = HuggingFaceModelWrapper(base_model_name, num_labels).to(device)
+            model = HuggingFaceModelWrapper(base_model_name, num_labels=num_labels, dropout=dropout).to(device)
             encoder_class = None  # Not used for HuggingFace wrapper
         
         batch_size, learning_rate, num_epochs = pretrained_batch_size, pretrained_learning_rate, pretrained_num_epochs
@@ -726,8 +767,7 @@ def get_model_config(
         batch_size=batch_size,
         learning_rate=learning_rate,
         num_epochs=num_epochs,
-        output_path=output_path,
-        best_model_path=best_model_path,
+        model_path=model_path,
         is_siamese=is_siamese,
         is_custom=is_custom,
         dataset_class=dataset_class,
@@ -737,7 +777,7 @@ def get_model_config(
 
 def load_model_from_config(config: ModelConfig, move_to_device: bool = True) -> nn.Module:
     """Load a model from disk using its config"""
-    path = config.best_model_path
+    path = config.model_path
     
     if config.is_custom or config.is_siamese:
         model = AuthorshipModel.from_pretrained(path, config.encoder_class)
@@ -818,7 +858,7 @@ def train_model(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     max_patience: int = 3,
-    weight_decay: float = 0.05
+    weight_decay: float = 0.1
 ) -> tuple[nn.Module, TrainingResult]:
     """
     Train a model and return results.
@@ -837,10 +877,26 @@ def train_model(
     best_model = model
     tokenizer = config.tokenizer
     
+    labels = train_df['label'].astype(int).values
+    class_counts = np.bincount(labels)  # [count_false, count_true]
+
+    # For weighted loss function
+    if WEIGHTED_LOSS:
+        class_weights = torch.tensor(len(labels) / (2 * class_counts), dtype=torch.float32).to(config.device)
+    else:
+        class_weights = None
+    
     train_dataset = config.dataset_class(train_df, tokenizer, config.max_length)
     val_dataset = config.dataset_class(val_df, tokenizer, config.max_length)
+
+    # For weighted sampler to balance classes in each batch
+    if WEIGHTED_SAMPLER:
+        sample_weights = 1.0 / class_counts[labels]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+        train_loader = DataLoader(train_dataset, batch_size=config.batch_size, sampler=sampler, num_workers=NUM_WORKERS)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=NUM_WORKERS)
     
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=NUM_WORKERS)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=NUM_WORKERS)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=weight_decay)
@@ -853,6 +909,7 @@ def train_model(
         pct_start=0.1,
         anneal_strategy='cos'
     )
+    label_smoothing = 0.1 if LABEL_SMOOTHING else 0.0
     
     print(f"\nTraining {config.model_name}")
     print(f"Train: {len(train_df)}, Val: {len(val_df)}")
@@ -860,9 +917,9 @@ def train_model(
     print(f"Total steps: {total_steps}")
     print("-" * 50)
 
-    os.makedirs(config.output_path, exist_ok=True)
-    model.save_pretrained(config.best_model_path)
-    tokenizer.save_pretrained(config.best_model_path)
+    os.makedirs(config.model_path, exist_ok=True)
+    model.save_pretrained(config.model_path)
+    tokenizer.save_pretrained(config.model_path)
     
     # Training loop
     best_f1 = 0
@@ -880,10 +937,10 @@ def train_model(
             
             if config.is_siamese:
                 input_ids1, attention_mask1, input_ids2, attention_mask2, labels = batch
-                outputs = model(input_ids1, attention_mask1, input_ids2, attention_mask2, labels=labels)
+                outputs = model(input_ids1, attention_mask1, input_ids2, attention_mask2, labels=labels, class_weights=class_weights, label_smoothing=label_smoothing)
             else:
                 input_ids, attention_mask, labels = batch
-                outputs = model(input_ids, attention_mask, labels=labels)
+                outputs = model(input_ids, attention_mask, labels=labels, class_weights=class_weights, label_smoothing=label_smoothing)
             
             optimizer.zero_grad()
             outputs.loss.backward()
@@ -925,7 +982,7 @@ def train_model(
             best_epoch = epoch + 1
             patience_counter = 0
             
-            model.save_pretrained(config.best_model_path)
+            model.save_pretrained(config.model_path)
             best_model = model
             print(f"  ✓ New best model saved (F1: {best_f1:.4f})")
         else:
@@ -937,7 +994,7 @@ def train_model(
     
     print("\n" + "=" * 50)
     print(f"Training complete! Best F1: {best_f1:.4f} at epoch {best_epoch}")
-    print(f"Best model saved to: {config.best_model_path}")
+    print(f"Best model saved to: {config.model_path}")
     print("=" * 50)
     
     return (
@@ -979,8 +1036,8 @@ def compare_models(
 
             # if the model has already been trained, load it
             try:
-                if (not ALWAYS_TRAIN) and os.path.exists(config.best_model_path):
-                    print(f"\nLoading trained model from {config.best_model_path}...")
+                if (not ALWAYS_TRAIN) and os.path.exists(config.model_path):
+                    print(f"\nLoading trained model from {config.model_path}...")
                     model = load_model_from_config(config)
                 else:
                     raise FileNotFoundError
@@ -1005,14 +1062,13 @@ def compare_models(
                 'test_recall': test_metrics['recall'],
                 'test_f1': test_metrics['f1'],
                 'test_auc_roc': test_metrics['auc_roc'],
-                'best_model_path': config.best_model_path,
+                'model_path': config.model_path,
                 'status': 'success'
             })
             
         except Exception as e:
             print(f"ERROR training {model_name}: {e}")
-            import traceback
-            traceback.print_exc()
+            
             results.append({
                 'model': model_name,
                 'status': 'failed',
@@ -1103,8 +1159,6 @@ print(f"Test set size: {len(test_df)}. Authorship change rate: {test_df['label']
 
 # ----- Code cell 13 -----
 
-import matplotlib.pyplot as plt
-
 if __name__ == '__main__':
     
     # Some options:
@@ -1113,21 +1167,24 @@ if __name__ == '__main__':
     # f'{SIAMESE_PREFIX}{CUSTOM_MODEL_NAME}'
     # 'prajjwal1/bert-mini'
     # f'{SIAMESE_PREFIX}prajjwal1/bert-mini'
-    """
+    
     siamese_mode = False
-    model_name = f'{SIAMESE_PREFIX}prajjwal1/bert-mini'
+    model_name = f'{CUSTOM_MODEL_NAME}'
 
     config = get_model_config(model_name, device)
 
     # if the model has already been trained, load it
     try:
-        if (not ALWAYS_TRAIN) and os.path.exists(config.best_model_path):
-            print(f"\nLoading trained model from {config.best_model_path}...")
+        if (not ALWAYS_TRAIN) and os.path.exists(config.model_path):
+            print(f"\nLoading trained model from {config.model_path}...")
             model = load_model_from_config(config)
         else:
             raise FileNotFoundError
     except Exception as e:
-        print(f"Could not load model: {e}")
+        if e is FileNotFoundError:
+            print(f"The model was not found at {config.model_path}.")
+        else:
+            print(f"Could not load model: {e}")
         print(f"\nTraining model {model_name} from scratch...")
         model, result = train_model(
             config=config,
@@ -1155,7 +1212,7 @@ if __name__ == '__main__':
         print(f"  {key.replace('_', '-').title():10s}: {test_metrics[key]:.4f}")
     
 # ----- Code cell 14 -----
-
+    
     """
     MODELS_TO_COMPARE = [
         CUSTOM_MODEL_NAME,
@@ -1173,22 +1230,19 @@ if __name__ == '__main__':
     
     comparison_df.to_csv('model_comparison_results.csv', index=False)
     print("\nComparison saved to model_comparison_results.csv")
-    
+    """
 
 # ----- Markdown cell -----
 
 # Testing a trained model for prediction on specific sentences
 
 # ----- Code cell 15 -----
-    """
-    # Load a trained model
-    #model_name = CUSTOM_MODEL_NAME
+    
+    model_name = CUSTOM_MODEL_NAME
     config = get_model_config(model_name, device)
-    
     model = load_model_from_config(config)
-    tokenizer = AutoTokenizer.from_pretrained(config.best_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
     
-    # Test prediction
     test_sent1 = test_df.iloc[0]['sentence1']
     test_sent2 = test_df.iloc[0]['sentence2']
     true_label = test_df.iloc[0]['label']
@@ -1206,4 +1260,11 @@ if __name__ == '__main__':
     print(f"True label: {true_label}")
     print(f"Predicted: {pred} (confidence: {conf:.2%})")
     print(f"Model: {model_name}")
-    """
+
+# ----- Markdown cell -----
+
+# Conclusion
+
+# If we were to continue improving this project, some possible directions include:
+# - Adding SMOTE or other data augmentation techniques to address class imbalance.
+# - Using Focal Loss or other loss functions tailored for imbalanced datasets.
