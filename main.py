@@ -10,7 +10,7 @@
 # ----- Code cell 1 -----
 
 import os
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # to avoid potential issues with macOS and some Windows setups
 import requests
 import zipfile
 import pandas as pd
@@ -22,13 +22,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 from sklearn.model_selection import train_test_split
-from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModel
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt
 
 RANDOM_SEED = 42
-NUM_WORKERS = 0 if os.name == 'nt' else 4
+NUM_WORKERS = 0 if os.name == 'nt' else 4  # 0 for Windows, 4 for Linux/Mac
 ALWAYS_PARSE = False  # Set to True to always re-parse the data
 ALWAYS_TRAIN = False  # Set to True to always re-train the model
 
@@ -353,7 +353,7 @@ class LightweightTransformerEncoder(BaseEncoder):
         model.load_state_dict(torch.load(os.path.join(path, 'pytorch_model.bin'), weights_only=True))
         return model
     
-    def num_parameters(self):
+    def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
 class PretrainedEncoder(BaseEncoder):
@@ -392,7 +392,7 @@ class PretrainedEncoder(BaseEncoder):
         instance.model_name = info['model_name']
         return instance
     
-    def num_parameters(self):
+    def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
 class ClassificationHead(nn.Module):
@@ -470,6 +470,8 @@ class AuthorshipModel(nn.Module):
         - Siamese mode: input_ids1/2 and attention_mask1/2 contain separate sentences
         """
         if self.siamese:
+            if input_ids2 is None or attention_mask2 is None:
+                raise ValueError("Siamese mode requires input_ids2 and attention_mask2")
             emb1 = self.encoder.encode(input_ids1, attention_mask1)
             emb2 = self.encoder.encode(input_ids2, attention_mask2)
             
@@ -514,7 +516,7 @@ class AuthorshipModel(nn.Module):
         model.classifier = ClassificationHead.from_pretrained(path)
         return model
     
-    def num_parameters(self):
+    def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
 
@@ -578,7 +580,7 @@ class HuggingFaceModelWrapper(nn.Module):
         instance.siamese = False
         return instance
     
-    def num_parameters(self):
+    def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
 # ----- Code cell 6 -----
@@ -696,6 +698,18 @@ def get_model_config(
         - 'siamese-custom-lightweight-transformer': Siamese custom transformer  
         - 'prajjwal1/bert-mini': Pretrained HuggingFace model
         - 'siamese-prajjwal1/bert-mini': Siamese pretrained model
+    
+    Parameters:
+        model_name: Name of the model
+        device: Device to use
+        max_length: Maximum sequence length
+        num_labels: Number of output labels
+        custom_*: Parameters for custom model
+        siamese_similarity_method: Method to combine embeddings in siamese mode ('concat', 'concat_diff', 'concat_diff_mult')
+        custom_*, pretrained_*: Training parameters for custom and pretrained models
+
+    Returns:
+        ModelConfig object
     """
     is_siamese = model_name.startswith(SIAMESE_PREFIX)
     base_model_name = model_name[len(SIAMESE_PREFIX):] if is_siamese else model_name
@@ -870,7 +884,7 @@ def train_model(
         weight_decay: L2 regularization
     
     Returns:
-        TrainingResult with metrics
+        tuple[nn.Module, TrainingResult]: The best model and training results including best F1, best epoch, final epoch, and training history
     """
     
     model = config.model
@@ -1042,7 +1056,10 @@ def compare_models(
                 else:
                     raise FileNotFoundError
             except Exception as e:
-                print(f"Could not load model: {e}")
+                if e is FileNotFoundError:
+                    print(f"The model was not found at {config.model_path}.")
+                else:
+                    print(f"Could not load model: {e}")
                 print(f"\nTraining model {model_name} from scratch...")
                 model, _ = train_model(
                     config=config,
